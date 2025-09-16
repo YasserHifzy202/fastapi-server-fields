@@ -390,7 +390,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
             if med_intent and not vacc_intent:
                 status_map[key] = "NOTE: Medication only (complete)"
             elif (not med_intent) and vacc_intent:
-                status_map[key] = "OK: Vaccination only (complete)"
+                status_map[key] = "NOTE: Vaccination only (complete)"
             elif med_intent and vacc_intent:
                 status_map[key] = "OK: Medication + Vaccination complete"
             else:
