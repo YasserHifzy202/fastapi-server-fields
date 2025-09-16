@@ -363,8 +363,11 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
         rows = [dict(r) for _, r in g.iterrows()]
 
         # intent
-        med_intent  = _any_present(rows, ["Medication","Medication Dose","Medication Batch","Medication Exp Date"])
-        vacc_intent = _any_present(rows, ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vaccination Exp Date","Vacc Method","Vacc Type"])
+        # نية الدواء لا تعتمد على تاريخ الانتهاء
+        med_intent  = _any_present(rows, ["Medication","Medication Dose","Medication Batch"])
+
+        # نية التحصين لا تعتمد على تاريخ الانتهاء (ولا على Doses Unit حتى لا ترفع نية بالخطأ)
+        vacc_intent = _any_present(rows, ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vacc Method","Vacc Type"])
 
         missing_med: List[str]  = []
         missing_vacc: List[str] = []
