@@ -1,9 +1,9 @@
-# server.py  — Poultry Fields API (v1.4.1)
+# server.py — Poultry Fields API (v1.4.2)
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Any, List, Dict
-import io, re, unicodedata, json
+from typing import Any, List, Dict, Optional
+import io, re, unicodedata, json, traceback
 import pandas as pd
 from datetime import datetime
 
@@ -17,9 +17,9 @@ ZERO_DATE_VALUE           = ""
 # =============== Helpers ===============
 def _to_ascii_digits(s: str) -> str:
     if not isinstance(s, str): s = str(s or "")
-    s = s.translate(str.maketrans("٠١٢٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹","011234567890123456789"))  # fix mapping typo
-    # Correct mapping:
+    # Arabic-Indic + Eastern Arabic-Indic
     s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹","01234567890123456789"))
+    # احذف محارف التحكم
     return "".join(ch for ch in s if not unicodedata.category(ch).startswith("C"))
 
 def _canon_token(v: Any) -> str:
@@ -33,7 +33,7 @@ def _canon_key(s: str) -> str:
 def is_blank(v: Any) -> bool:
     return _canon_token(v) == ""
 
-def _num_or_none(v: Any):
+def _num_or_none(v: Any) -> Optional[float]:
     s = _canon_token(v)
     if not s: return None
     m = re.search(r"-?\d+(?:[.,]\d+)?", s)
@@ -148,29 +148,41 @@ def drop_columns_by_names(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
     keep = [c for c in df.columns if _canon_key(c) not in target]
     return df[keep]
 
-# --------- Load Excel ---------
-def load_report_from_excel(content: bytes) -> pd.DataFrame:
-    xl = pd.ExcelFile(io.BytesIO(content))
-    pick = None
-    for s in xl.sheet_names:
-        if s.strip().lower() in {"export","ag-grid"}:
-            pick = s; break
-    if pick is None: pick = xl.sheet_names[0]
-    df = xl.parse(pick)
+# --------- Load Excel (supports .xls + .xlsx) ---------
+def load_report_from_excel(content: bytes, filename: Optional[str]) -> pd.DataFrame:
+    try:
+        name = (filename or "").lower()
+        engine = "openpyxl"
+        if name.endswith(".xls"):  # legacy
+            engine = "xlrd"
+        xl = pd.ExcelFile(io.BytesIO(content), engine=engine)
+        pick = None
+        for s in xl.sheet_names:
+            if s.strip().lower() in {"export","ag-grid"}:
+                pick = s; break
+        if pick is None: pick = xl.sheet_names[0]
+        df = xl.parse(pick)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read Excel ({filename}): {e}"
+        )
+
+    # normalize + clean
     df = normalize_headers(df).fillna("")
     df = normalize_domain_columns(df)
-    # clean exp dates placeholders
+
     for col in ["Medication Exp Date","Vaccination Exp Date"]:
         if col in df.columns:
             s = df[col].astype(str).str.strip()
             bad = s.str.upper().isin({"#VALUE!","#VALUE","VALUE!","VALUE"}) | s.isin(["0","00/00/0000","0000-00-00"])
             df.loc[bad, col] = ""
+
     if DROP_LAST_N_ROWS and len(df) >= DROP_LAST_N_ROWS:
         df = df.iloc[:-DROP_LAST_N_ROWS, :].copy()
     return df
 
 def strip_time_from_date_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # ✅ استخدم محوّلنا الآمن بدل to_datetime المباشر
     for c in [c for c in df.columns if "date" in c.lower()]:
         df[c] = df[c].apply(_date_strict)
     return df
@@ -279,7 +291,6 @@ def add_operational_status(op_df: pd.DataFrame) -> pd.DataFrame:
 
 # --------- Care Status ---------
 CARE_MED_REQ  = ["Medication","Medication Dose","Medication Batch","Medication Exp Date","Doctor Name"]
-# ⚠️ شلّينا Doses Unit من required القائمة للّقاح (تصير مشروطة إذا الجرعة > 0)
 CARE_VACC_REQ = ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vaccination Exp Date","Vacc Method","Vacc Type","Doctor Name"]
 NUMERICISH_REQUIRED = {"Medication Dose","VaccinevDoze"}
 
@@ -329,7 +340,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
         missing_med, missing_vacc = [], []
         extra_errors, codes = [], []
 
-        # ---- Medication checks ----
+        # Medication checks
         if med_intent:
             for col in CARE_MED_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
@@ -353,18 +364,16 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                         codes.append("MED_EXPIRED")
                         break
 
-        # ---- Vaccination checks ----
+        # Vaccination checks
         if vacc_intent:
             for col in CARE_VACC_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
                     missing_vacc.append(col); codes.append("VACC_MISSING_"+_canon_key(col).upper())
 
-            # Batch validity (0, -, ...)
             if not any(not _invalid_batch(r.get("VaccinationBatch")) for r in rows):
                 if "VaccinationBatch" not in missing_vacc: missing_vacc.append("VaccinationBatch")
                 codes.append("VACC_MISSING_BATCH")
 
-            # Unit required only if numeric dose present
             vacc_dose_any = any((_num_or_none(r.get("VaccinevDoze")) or 0) > 0 for r in rows)
             vacc_has_unit = any(_canon_unit(r.get("Doses Unit")) for r in rows if not is_blank(r.get("Doses Unit")))
             if vacc_dose_any and not vacc_has_unit:
@@ -379,7 +388,6 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                         codes.append("VACC_EXPIRED")
                         break
 
-        # ---- Decide ----
         if (med_intent and missing_med) or (vacc_intent and missing_vacc) or extra_errors:
             parts = []
             if missing_med:  parts.append("Medication → "  + ", ".join(sorted(set(missing_med))))
@@ -406,7 +414,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
 def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return [] if df is None or df.empty else json.loads(df.to_json(orient="records"))
 
-app = FastAPI(title="Poultry Fields API", version="1.4.1")
+app = FastAPI(title="Poultry Fields API", version="1.4.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -419,13 +427,20 @@ def health():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    content = await file.read()
-    df = load_report_from_excel(content)
-    df = strip_time_from_date_columns(df)
-    sections = split_sections(df)
-    op_df   = add_operational_status(sections["operational"])
-    care_df = add_care_status(sections["care"])
-    return {"ops": df_to_records(op_df), "care": df_to_records(care_df)}
+    try:
+        content = await file.read()
+        df = load_report_from_excel(content, file.filename)
+        df = strip_time_from_date_columns(df)
+        sections = split_sections(df)
+        op_df   = add_operational_status(sections["operational"])
+        care_df = add_care_status(sections["care"])
+        return {"ops": df_to_records(op_df), "care": df_to_records(care_df)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # اطبع الستاك للّوغز في Render وسلّم رد واضح للواجهة
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     import uvicorn
