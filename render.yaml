@@ -1,9 +1,8 @@
 services:
-  - name: poultry-fields
+  - type: web
+    name: fastapi-server-fields
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port 10000
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn server:app --host 0.0.0.0 --port $PORT"
+    autoDeploy: true

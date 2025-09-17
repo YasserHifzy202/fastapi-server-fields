@@ -1,22 +1,10 @@
-# C:\flutterapps\database_update\Backend\fastapi-server-fields\server.py
-# =============================================================================
-# FastAPI API لتغليف منطق التقسيم والتنظيف وإضافة "Status"
-# Endpoints:
-#   GET  /health   -> فحص سريع
-#   POST /analyze  -> يقرأ ملف Excel ويُرجع {"ops": [...], "care": [...]}
-# ملاحظات:
-# - كشف التكرار يبقى كما هو.
-# - Status إنجليزي فقط:  ERROR / NOTE / OK  مع أسباب واضحة.
-# - في الرعاية: أي نقص بواحد من REQUIRED مع وجود intent => ERROR.
-#   Medication-only مكتمل => NOTE. غير ذلك => OK (مع سبب).
-# - الجرعات الرقمية إذا كانت 0 تعتبر ناقصة.
-# =============================================================================
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, List, Dict, Tuple
 import io, re, unicodedata, json
 import pandas as pd
+import numpy as np
 
 # ---------------- Options ----------------
 STRICT_USER_ID_ONLY       = True
@@ -279,6 +267,7 @@ OPTIONAL_NOTE_FIELDS = [
     "Animal Mortality","Animals Culled","Supplied Feed","Animal Weight",
     "Animal Uniformity","Egg Weight Table_Egg","Animal CV Uniformity","Animals Added",
 ]
+
 def _group_has_numeric(rows: List[dict], field: str) -> bool:
     for r in rows:
         if field in r and _num_or_none(r.get(field)) is not None:
@@ -289,6 +278,15 @@ def _group_has_text(rows: List[dict], field: str) -> bool:
         if field in r and not is_blank(r.get(field, "")):
             return True
     return False
+
+def _any_group_numbers(rows: List[dict], field: str) -> List[float]:
+    vals = []
+    for r in rows:
+        if field in r:
+            n = _num_or_none(r.get(field))
+            if n is not None:
+                vals.append(float(n))
+    return vals
 
 def add_operational_status(op_df: pd.DataFrame) -> pd.DataFrame:
     if op_df.empty or ("Flock" not in op_df.columns) or ("Date" not in op_df.columns):
@@ -302,9 +300,11 @@ def add_operational_status(op_df: pd.DataFrame) -> pd.DataFrame:
         if key.endswith("||"):
             status_map[key] = "ERROR: Date"
             continue
+
         rows = [dict(r) for _, r in g.iterrows()]
         flock_name = str(g["Flock"].iloc[0])
 
+        # 1) المفقودات الأساسية
         missing: List[str] = []
         for col in OP_REQUIRED_NUMERIC:
             if not _group_has_numeric(rows, col):
@@ -316,12 +316,50 @@ def add_operational_status(op_df: pd.DataFrame) -> pd.DataFrame:
             if not _group_has_numeric(rows, "Table Eggs Prod"):
                 missing.append("Table Eggs Prod")
 
-        if missing:
-            status_map[key] = "ERROR: " + ", ".join(sorted(set(missing)))
+        # 2) فحوصات منطقية (sanity)
+        anomalies: List[str] = []
+        # Temperature Low <= High
+        lows  = _any_group_numbers(rows, "Temperature Low")
+        highs = _any_group_numbers(rows, "Temperature High")
+        if lows and highs:
+            # لو أي زوج متاح (أخذ متوسط للنظر العام أو قَيم صفية)
+            if np.nanmax(lows) > np.nanmin(highs):
+                anomalies.append("Temperature Low>High")
+
+        # Humidity [0..100]
+        hums = _any_group_numbers(rows, "Humidity")
+        if any((h < 0 or h > 100) for h in hums):
+            anomalies.append("Humidity out of [0–100]")
+
+        # Light intensity % [0..100]
+        li = _any_group_numbers(rows, "Light intensity %")
+        if any((x < 0 or x > 100) for x in li):
+            anomalies.append("Light intensity % out of [0–100]")
+
+        # Light_Duration (HU) [0..24]
+        ld = _any_group_numbers(rows, "Light_Duration (HU)")
+        if any((x < 0 or x > 24) for x in ld):
+            anomalies.append("Light_Duration (HU) out of [0–24]")
+
+        # Non-negative checks
+        for col in ["Animal Feed Consumed","Water Consumption","Ammonia Level"]:
+            vals = _any_group_numbers(rows, col)
+            if any(x < 0 for x in vals):
+                anomalies.append(f"{col} negative")
+
+        # 3) القرار
+        if missing or anomalies:
+            parts = []
+            if missing:
+                parts.append(", ".join(sorted(set(missing))))
+            if anomalies:
+                parts.append("; ".join(sorted(set(anomalies))))
+            status_map[key] = "ERROR: " + " ; ".join(parts)
         else:
+            # NOTE fields إن كانت موجودة
             present_notes = []
             for col in OPTIONAL_NOTE_FIELDS:
-                if col in op_df.columns and (_group_has_text(rows, col) or _group_has_numeric(rows, col)):
+                if (col in op_df.columns) and (_group_has_text(rows, col) or _group_has_numeric(rows, col)):
                     present_notes.append(col)
             status_map[key] = "NOTE: " + ", ".join(sorted(set(present_notes))) if present_notes else "OK"
 
@@ -362,11 +400,8 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
 
         rows = [dict(r) for _, r in g.iterrows()]
 
-        # intent
-        # نية الدواء لا تعتمد على تاريخ الانتهاء
+        # نية (بدون إلزام تاريخ الانتهاء/الوحدة لعدم رفع نية بالخطأ)
         med_intent  = _any_present(rows, ["Medication","Medication Dose","Medication Batch"])
-
-        # نية التحصين لا تعتمد على تاريخ الانتهاء (ولا على Doses Unit حتى لا ترفع نية بالخطأ)
         vacc_intent = _any_present(rows, ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vacc Method","Vacc Type"])
 
         missing_med: List[str]  = []
@@ -376,12 +411,12 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
             for col in CARE_MED_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
                     missing_med.append(col)
+
         if vacc_intent:
             for col in CARE_VACC_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
                     missing_vacc.append(col)
 
-        # decide
         if (med_intent and missing_med) or (vacc_intent and missing_vacc):
             parts = []
             if missing_med:
@@ -400,7 +435,8 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                 status_map[key] = "OK: No care data"
 
     care_df["Status"] = care_df["_gkey"].map(status_map).fillna("OK: No care data")
-    return care_df.drop(columns=["_gkey"])
+    care_df = care_df.drop(columns=["_gkey"])
+    return care_df
 
 # ===================== Utilities =====================
 def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -409,7 +445,7 @@ def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 # ===================== FastAPI App =====================
-app = FastAPI(title="Poultry Fields API", version="1.3.0")
+app = FastAPI(title="Poultry Fields API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
