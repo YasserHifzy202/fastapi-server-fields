@@ -1,22 +1,11 @@
-# C:\flutterapps\database_update\Backend\fastapi-server-fields\server.py
-# =============================================================================
-# FastAPI API لتغليف منطق التقسيم والتنظيف وإضافة "Status"
-# Endpoints:
-#   GET  /health   -> فحص سريع
-#   POST /analyze  -> يقرأ ملف Excel ويُرجع {"ops": [...], "care": [...]}
-# ملاحظات:
-# - كشف التكرار يبقى كما هو.
-# - Status إنجليزي فقط:  ERROR / NOTE / OK  مع أسباب واضحة.
-# - في الرعاية: أي نقص بواحد من REQUIRED مع وجود intent => ERROR.
-#   Medication-only مكتمل => NOTE. غير ذلك => OK (مع سبب).
-# - الجرعات الرقمية إذا كانت 0 تعتبر ناقصة.
-# =============================================================================
+# server.py  — Poultry Fields API (v1.4.1)
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Any, List, Dict, Tuple
+from typing import Any, List, Dict
 import io, re, unicodedata, json
 import pandas as pd
+from datetime import datetime
 
 # ---------------- Options ----------------
 STRICT_USER_ID_ONLY       = True
@@ -25,20 +14,21 @@ STRIP_NON_SECTION_COLUMNS = True
 DROP_LAST_N_ROWS          = 2
 ZERO_DATE_VALUE           = ""
 
-# ===================== Helpers / Normalization =====================
+# =============== Helpers ===============
 def _to_ascii_digits(s: str) -> str:
     if not isinstance(s, str): s = str(s or "")
+    s = s.translate(str.maketrans("٠١٢٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹","011234567890123456789"))  # fix mapping typo
+    # Correct mapping:
     s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹","01234567890123456789"))
     return "".join(ch for ch in s if not unicodedata.category(ch).startswith("C"))
 
-def _canon_token(s: Any) -> str:
-    s = _to_ascii_digits(str(s or "").strip().lower())
-    s = re.sub(r"\s+", " ", s)
-    return s.replace("٬","").replace("،","")
+def _canon_token(v: Any) -> str:
+    s = _to_ascii_digits(str(v or "")).strip().lower()
+    s = re.sub(r"\s+"," ", s).replace("٬","").replace("،","")
+    return s
 
 def _canon_key(s: str) -> str:
-    s = _canon_token(s)
-    return re.sub(r"[^\w]+", "", s)
+    return re.sub(r"[^\w]+","", _canon_token(s))
 
 def is_blank(v: Any) -> bool:
     return _canon_token(v) == ""
@@ -48,30 +38,42 @@ def _num_or_none(v: Any):
     if not s: return None
     m = re.search(r"-?\d+(?:[.,]\d+)?", s)
     if not m: return None
+    try: return float(m.group(0).replace(",", "."))
+    except: return None
+
+BAD_DATE_TOKENS = {"", "0", "00/00/0000", "0000-00-00", "#value!", "#value", "value", "value!"}
+
+def _dt_or_none(v: Any):
+    s = _canon_token(v)
+    if s in BAD_DATE_TOKENS:
+        return None
+    # excel serial
     try:
-        return float(m.group(0).replace(",", "."))
+        n = float(s)
+        if 20000 < n < 80000:
+            base = datetime(1899, 12, 30)
+            return base + pd.to_timedelta(int(n), unit="D")
+    except:
+        pass
+    try:
+        return pd.to_datetime(s, errors="coerce", dayfirst=True).to_pydatetime()
     except:
         return None
 
-# --------- Aliases لرؤوس أساسية ---------
+def _date_strict(v: Any) -> str:
+    dt = _dt_or_none(v)
+    return "" if dt is None else dt.strftime("%Y-%m-%d")
+
+def _invalid_batch(v: Any) -> bool:
+    s = _canon_token(v)
+    return s in {"", "-", "na", "null", "0", "000"}
+
+# --------- Aliases ---------
 COLUMN_ALIASES = {
     "Flock":  ["Flock","Flock Name","Flock ID","Flock Code","Flock No","القطيع","اسم القطيع"],
     "Date":   ["Date","Record Date","Entry Date","Report Date","Day","Day Date","Date/Time","التاريخ"],
     "User ID":["User ID","Creation User ID","UserID","Created By","Created By ID"],
 }
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.rename(columns=lambda c: re.sub(r"\s+"," ", str(c)).strip())
-    low = {str(c).strip().lower(): c for c in df.columns}
-    mapping = {}
-    for canon, aliases in COLUMN_ALIASES.items():
-        for a in aliases:
-            k = a.strip().lower()
-            if k in low:
-                mapping[low[k]] = canon
-                break
-    return df.rename(columns=mapping)
-
-# --------- Aliases لأعمدة الدومين ---------
 CARE_COLUMN_ALIASES = {
     "Medication":             ["Medicine Name","Drug","Med Name"],
     "Medication Dose":        ["Med Dose","Dose","Dose Qty","Medicine Dose"],
@@ -94,12 +96,24 @@ OP_COLUMN_ALIASES = {
     "Egg Weight Table_Egg":["Egg Weight","Table Egg Weight","Egg Weight Table Egg"],
     "Animal CV Uniformity":["CV Uniformity","Uniformity CV"],
 }
+
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns=lambda c: re.sub(r"\s+"," ", str(c)).strip())
+    low = {str(c).strip().lower(): c for c in df.columns}
+    ren = {}
+    for canon, aliases in COLUMN_ALIASES.items():
+        for a in aliases:
+            k = a.strip().lower()
+            if k in low:
+                ren[low[k]] = canon
+                break
+    return df.rename(columns=ren)
+
 def normalize_domain_columns(df: pd.DataFrame) -> pd.DataFrame:
     low = {str(c).strip().lower(): c for c in df.columns}
     ren = {}
     for canon, aliases in {**CARE_COLUMN_ALIASES, **OP_COLUMN_ALIASES}.items():
-        if canon in df.columns:
-            continue
+        if canon in df.columns: continue
         for a in aliases:
             a_low = a.strip().lower()
             if a_low in low:
@@ -107,7 +121,7 @@ def normalize_domain_columns(df: pd.DataFrame) -> pd.DataFrame:
                 break
     return df.rename(columns=ren)
 
-# --------- مؤشرات ---------
+# --------- Indicators / Drops ----------
 CARE_INDICATORS = [
     "Medication","Medication Dose","Medication Batch","Medication Exp Date",
     "Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch",
@@ -122,24 +136,46 @@ OP_INDICATORS = [
     "Animal Feed Formula Name","House ID","Post Status","Egg Weight Table_Egg",
     "Animal CV Uniformity","Animals Added",
 ]
-
-# --------- أعمدة تُحذف من القسمين ---------
 SHARED_ALWAYS_DROP = [
     "Last Mod Date","Creation User ID","Farm ID","Creation Date","Farm Name",
     "Growout ID","Farm Stage","Growout Name","Pen ID","Flock ID",
     "Transaction Time","Feed Inventory Delivery Status","Flock History","Ref #",
     "Void","Cycle",
 ]
+
 def drop_columns_by_names(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
     target = {_canon_key(n) for n in names}
-    keep_cols = []
-    for c in df.columns:
-        if _canon_key(c) in target:
-            continue
-        keep_cols.append(c)
-    return df[keep_cols]
+    keep = [c for c in df.columns if _canon_key(c) not in target]
+    return df[keep]
 
-# --------- فصل بالرعاية عبر User ID ---------
+# --------- Load Excel ---------
+def load_report_from_excel(content: bytes) -> pd.DataFrame:
+    xl = pd.ExcelFile(io.BytesIO(content))
+    pick = None
+    for s in xl.sheet_names:
+        if s.strip().lower() in {"export","ag-grid"}:
+            pick = s; break
+    if pick is None: pick = xl.sheet_names[0]
+    df = xl.parse(pick)
+    df = normalize_headers(df).fillna("")
+    df = normalize_domain_columns(df)
+    # clean exp dates placeholders
+    for col in ["Medication Exp Date","Vaccination Exp Date"]:
+        if col in df.columns:
+            s = df[col].astype(str).str.strip()
+            bad = s.str.upper().isin({"#VALUE!","#VALUE","VALUE!","VALUE"}) | s.isin(["0","00/00/0000","0000-00-00"])
+            df.loc[bad, col] = ""
+    if DROP_LAST_N_ROWS and len(df) >= DROP_LAST_N_ROWS:
+        df = df.iloc[:-DROP_LAST_N_ROWS, :].copy()
+    return df
+
+def strip_time_from_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # ✅ استخدم محوّلنا الآمن بدل to_datetime المباشر
+    for c in [c for c in df.columns if "date" in c.lower()]:
+        df[c] = df[c].apply(_date_strict)
+    return df
+
+# --------- Split sections ---------
 CARE_UID_PATTERNS = [
     re.compile(r"layer\s*vet(\s*pm\d*)?$", re.I),
     re.compile(r"^lvetp\d*$", re.I),
@@ -152,76 +188,10 @@ def is_care_user(uid: Any) -> bool:
 
 def row_has_any_value(row: pd.Series, cols: List[str]) -> bool:
     for c in cols:
-        if c in row.index and str(row.get(c, "")).strip() != "":
-            return True
+        if c in row.index and str(row.get(c, "")).strip() != "": return True
     return False
 
-# --------- تحميل ---------
-def load_report_from_excel(content: bytes) -> pd.DataFrame:
-    xl = pd.ExcelFile(io.BytesIO(content))
-    pick = None
-    for s in xl.sheet_names:
-        if s.strip().lower() in {"export","ag-grid"}:
-            pick = s; break
-    if pick is None: pick = xl.sheet_names[0]
-    df = xl.parse(pick)
-    df = normalize_headers(df).fillna("")
-    df = normalize_domain_columns(df)
-    if DROP_LAST_N_ROWS and len(df) >= DROP_LAST_N_ROWS:
-        df = df.iloc[:-DROP_LAST_N_ROWS, :].copy()
-    return df
-
-# --------- توحيد التواريخ ---------
-def strip_time_from_date_columns(df: pd.DataFrame) -> pd.DataFrame:
-    date_cols = [c for c in df.columns if "date" in c.lower()]
-    for c in date_cols:
-        parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-        ok = parsed.notna()
-        df.loc[ok, c] = parsed.loc[ok].dt.strftime("%Y-%m-%d")
-        df.loc[~ok, c] = ""
-        df[c] = df[c].astype(str)
-    return df
-
-# --------- كشف أعمدة كلها صفر ---------
-def _extract_number_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).map(_to_ascii_digits).str.replace("٬","", regex=False).str.replace("،","", regex=False)
-    num = s.str.extract(r'(-?\d+(?:[.,]\d+)?)', expand=False)
-    if num is None:
-        return pd.Series([pd.NA]*len(s), index=s.index)
-    num = num.str.replace(",", ".", regex=False)
-    return pd.to_numeric(num, errors='coerce')
-
-PROTECTED_COLS = {"Flock","Date","User ID"}
-def drop_all_zero_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    drop_cols = []
-    for col in df.columns:
-        if col in PROTECTED_COLS:
-            continue
-        ser = df[col]
-        if pd.api.types.is_numeric_dtype(ser):
-            vals = ser.dropna()
-            if len(vals) and (vals == 0).all():
-                drop_cols.append(col)
-        else:
-            nums = _extract_number_series(ser)
-            mask = nums.notna()
-            if mask.any() and nums[mask].eq(0).all():
-                drop_cols.append(col)
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df, drop_cols
-
-def strip_care_from_operational(op_df: pd.DataFrame) -> pd.DataFrame:
-    care_cols = [c for c in CARE_INDICATORS if c in op_df.columns]
-    return op_df.drop(columns=care_cols) if care_cols else op_df
-
-def strip_operational_from_care(care_df: pd.DataFrame) -> pd.DataFrame:
-    op_cols = [c for c in OP_INDICATORS if c in care_df.columns]
-    return care_df.drop(columns=op_cols) if op_cols else care_df
-
-# --------- Split sections ---------
 def split_sections(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    df = df.copy()
     uid_col = "User ID" if "User ID" in df.columns else None
 
     if uid_col and STRICT_USER_ID_ONLY:
@@ -235,39 +205,27 @@ def split_sections(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     op_df   = df[~care_mask].copy()
 
     if STRIP_NON_SECTION_COLUMNS:
-        op_df   = strip_care_from_operational(op_df)
-        care_df = strip_operational_from_care(care_df)
+        op_df   = op_df.drop(columns=[c for c in CARE_INDICATORS if c in op_df.columns], errors="ignore")
+        care_df = care_df.drop(columns=[c for c in OP_INDICATORS   if c in care_df.columns], errors="ignore")
 
     op_df   = drop_columns_by_names(op_df, SHARED_ALWAYS_DROP)
     care_df = drop_columns_by_names(care_df, SHARED_ALWAYS_DROP)
 
-    # Clean Vaccination Exp Date (bad tokens)
-    if "Vaccination Exp Date" in care_df.columns:
-        s = care_df["Vaccination Exp Date"].astype(str).str.strip()
-        bad_mask = s.str.upper().isin({"#VALUE!","#VALUE","VALUE!","VALUE"}) | s.isin(["0","00/00/0000","0000-00-00"])
-        care_df.loc[bad_mask, "Vaccination Exp Date"] = ""
-
     op_df   = strip_time_from_date_columns(op_df)
     care_df = strip_time_from_date_columns(care_df)
 
-    if ZERO_DATE_VALUE and "Vaccination Exp Date" in care_df.columns:
-        z = care_df["Vaccination Exp Date"].astype(str).str.strip()
-        mask = (z == "")
-        care_df.loc[mask, "Vaccination Exp Date"] = ZERO_DATE_VALUE
-
     return {"operational": op_df, "care": care_df}
 
-# ===================== Operational Status =====================
+# --------- Operational Status ---------
 OP_REQUIRED_NUMERIC = [
     "Animal Feed Consumed","Water Consumption","Temperature Low",
     "Temperature High","Ammonia Level","Humidity",
     "Light_Duration (HU)","Light intensity %","Animal Feed Inventory",
 ]
-OP_REQUIRED_TEXT = [
-    "Animal Feed Type Name","Female Feed Type ID","Female Feed Formula ID",
-]
+OP_REQUIRED_TEXT = ["Animal Feed Type Name","Female Feed Type ID","Female Feed Formula ID"]
 PROD_CODE_RX = re.compile(r"f\d+[pr]", re.I)
-def is_production_flock_name(name: Any) -> bool:
+
+def _is_prod_flock(name: Any) -> bool:
     s = _canon_token(name)
     if "clpf" in s: return True
     if "clrf" in s: return False
@@ -279,64 +237,65 @@ OPTIONAL_NOTE_FIELDS = [
     "Animal Mortality","Animals Culled","Supplied Feed","Animal Weight",
     "Animal Uniformity","Egg Weight Table_Egg","Animal CV Uniformity","Animals Added",
 ]
+
 def _group_has_numeric(rows: List[dict], field: str) -> bool:
     for r in rows:
-        if field in r and _num_or_none(r.get(field)) is not None:
-            return True
+        if field in r and _num_or_none(r.get(field)) is not None: return True
     return False
+
 def _group_has_text(rows: List[dict], field: str) -> bool:
     for r in rows:
-        if field in r and not is_blank(r.get(field, "")):
-            return True
+        if field in r and not is_blank(r.get(field, "")): return True
     return False
 
 def add_operational_status(op_df: pd.DataFrame) -> pd.DataFrame:
     if op_df.empty or ("Flock" not in op_df.columns) or ("Date" not in op_df.columns):
-        op_df["Status"] = ""
-        return op_df
-
+        op_df["Status"] = ""; return op_df
     op_df["_gkey"] = op_df["Flock"].astype(str).str.lower().str.strip() + "||" + op_df["Date"].astype(str)
-    status_map: Dict[str,str] = {}
-
+    status_map = {}
     for key, g in op_df.groupby("_gkey", sort=False):
         if key.endswith("||"):
-            status_map[key] = "ERROR: Date"
-            continue
+            status_map[key] = "ERROR: Date"; continue
         rows = [dict(r) for _, r in g.iterrows()]
-        flock_name = str(g["Flock"].iloc[0])
-
-        missing: List[str] = []
+        flock = str(g["Flock"].iloc[0])
+        missing = []
         for col in OP_REQUIRED_NUMERIC:
-            if not _group_has_numeric(rows, col):
-                missing.append(col)
+            if not _group_has_numeric(rows, col): missing.append(col)
         for col in OP_REQUIRED_TEXT:
-            if not _group_has_text(rows, col):
-                missing.append(col)
-        if is_production_flock_name(flock_name):
+            if not _group_has_text(rows, col): missing.append(col)
+        if _is_prod_flock(flock):
             if not _group_has_numeric(rows, "Table Eggs Prod"):
                 missing.append("Table Eggs Prod")
-
         if missing:
             status_map[key] = "ERROR: " + ", ".join(sorted(set(missing)))
         else:
-            present_notes = []
+            notes = []
             for col in OPTIONAL_NOTE_FIELDS:
                 if col in op_df.columns and (_group_has_text(rows, col) or _group_has_numeric(rows, col)):
-                    present_notes.append(col)
-            status_map[key] = "NOTE: " + ", ".join(sorted(set(present_notes))) if present_notes else "OK"
-
+                    notes.append(col)
+            status_map[key] = "NOTE: " + ", ".join(sorted(set(notes))) if notes else "OK"
     op_df["Status"] = op_df["_gkey"].map(status_map).fillna("OK")
     return op_df.drop(columns=["_gkey"])
 
-# ===================== Care Status =====================
-CARE_MED_REQ = [
-    "Medication","Medication Dose","Medication Batch","Medication Exp Date","Doctor Name",
-]
-CARE_VACC_REQ = [
-    "Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch",
-    "Vaccination Exp Date","Vacc Method","Vacc Type","Doses Unit","Doctor Name",
-]
-NUMERICISH_REQUIRED = {"Medication Dose","VaccinevDoze"}  # must be > 0
+# --------- Care Status ---------
+CARE_MED_REQ  = ["Medication","Medication Dose","Medication Batch","Medication Exp Date","Doctor Name"]
+# ⚠️ شلّينا Doses Unit من required القائمة للّقاح (تصير مشروطة إذا الجرعة > 0)
+CARE_VACC_REQ = ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vaccination Exp Date","Vacc Method","Vacc Type","Doctor Name"]
+NUMERICISH_REQUIRED = {"Medication Dose","VaccinevDoze"}
+
+ALLOWED_UNITS = {
+    "ml": {"ml","ml.","mL","milliliter","milliliters","cc"},
+    "mg": {"mg","mg.","milligram","milligrams"},
+    "g":  {"g","g.","gram","grams"},
+    "kg": {"kg","kg.","kilogram","kilograms"},
+    "iu": {"iu","iu.","international unit","international units"},
+    "dose": {"dose","doses"},
+}
+def _canon_unit(v: Any) -> str:
+    s = _canon_token(v)
+    for k, alts in ALLOWED_UNITS.items():
+        if s in alts or s == k: return k
+    return s
 
 def _field_present(field: str, value: Any) -> bool:
     if field in NUMERICISH_REQUIRED:
@@ -349,45 +308,83 @@ def _any_present(rows: List[dict], cols: List[str]) -> bool:
 
 def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
     if care_df.empty or ("Flock" not in care_df.columns) or ("Date" not in care_df.columns):
-        care_df["Status"] = ""
-        return care_df
+        care_df["Status"] = ""; care_df["StatusReasonCodes"] = [[] for _ in range(len(care_df))]; return care_df
 
     care_df["_gkey"] = care_df["Flock"].astype(str).str.lower().str.strip() + "||" + care_df["Date"].astype(str)
-    status_map: Dict[str,str] = {}
+    status_map, codes_map = {}, {}
 
     for key, g in care_df.groupby("_gkey", sort=False):
         if key.endswith("||"):
-            status_map[key] = "ERROR: Date"
-            continue
+            status_map[key] = "ERROR: Date"; codes_map[key]=["DATE_MISSING"]; continue
 
         rows = [dict(r) for _, r in g.iterrows()]
+        ref_dt = None
+        for r in rows:
+            ref_dt = _dt_or_none(r.get("Date"))
+            if ref_dt: break
 
-        # intent
-        # نية الدواء لا تعتمد على تاريخ الانتهاء
         med_intent  = _any_present(rows, ["Medication","Medication Dose","Medication Batch"])
-
-        # نية التحصين لا تعتمد على تاريخ الانتهاء (ولا على Doses Unit حتى لا ترفع نية بالخطأ)
         vacc_intent = _any_present(rows, ["Vaccination","Vaccine Name","VaccinevDoze","VaccinationBatch","Vacc Method","Vacc Type"])
 
-        missing_med: List[str]  = []
-        missing_vacc: List[str] = []
+        missing_med, missing_vacc = [], []
+        extra_errors, codes = [], []
 
+        # ---- Medication checks ----
         if med_intent:
             for col in CARE_MED_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
-                    missing_med.append(col)
+                    missing_med.append(col); codes.append("MED_MISSING_"+_canon_key(col).upper())
+
+            dose_any = any((_num_or_none(r.get("Medication Dose")) or 0) > 0 for r in rows)
+            has_unit = any(_canon_unit(r.get("Doses Unit")) for r in rows if not is_blank(r.get("Doses Unit")))
+            if dose_any and not has_unit:
+                if "Doses Unit" not in missing_med: missing_med.append("Doses Unit")
+                codes.append("MED_MISSING_DOSE_UNIT")
+
+            if not any(not _invalid_batch(r.get("Medication Batch")) for r in rows):
+                if "Medication Batch" not in missing_med: missing_med.append("Medication Batch")
+                codes.append("MED_MISSING_BATCH")
+
+            if ref_dt is not None:
+                for r in rows:
+                    ex = _dt_or_none(r.get("Medication Exp Date"))
+                    if ex is not None and ex < ref_dt:
+                        extra_errors.append(f"Medication → Expired batch ({ex.date()})")
+                        codes.append("MED_EXPIRED")
+                        break
+
+        # ---- Vaccination checks ----
         if vacc_intent:
             for col in CARE_VACC_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
-                    missing_vacc.append(col)
+                    missing_vacc.append(col); codes.append("VACC_MISSING_"+_canon_key(col).upper())
 
-        # decide
-        if (med_intent and missing_med) or (vacc_intent and missing_vacc):
+            # Batch validity (0, -, ...)
+            if not any(not _invalid_batch(r.get("VaccinationBatch")) for r in rows):
+                if "VaccinationBatch" not in missing_vacc: missing_vacc.append("VaccinationBatch")
+                codes.append("VACC_MISSING_BATCH")
+
+            # Unit required only if numeric dose present
+            vacc_dose_any = any((_num_or_none(r.get("VaccinevDoze")) or 0) > 0 for r in rows)
+            vacc_has_unit = any(_canon_unit(r.get("Doses Unit")) for r in rows if not is_blank(r.get("Doses Unit")))
+            if vacc_dose_any and not vacc_has_unit:
+                if "Doses Unit" not in missing_vacc: missing_vacc.append("Doses Unit")
+                codes.append("VACC_MISSING_DOSE_UNIT")
+
+            if ref_dt is not None:
+                for r in rows:
+                    ex = _dt_or_none(r.get("Vaccination Exp Date"))
+                    if ex is not None and ex < ref_dt:
+                        extra_errors.append(f"Vaccination → Expired batch ({ex.date()})")
+                        codes.append("VACC_EXPIRED")
+                        break
+
+        # ---- Decide ----
+        if (med_intent and missing_med) or (vacc_intent and missing_vacc) or extra_errors:
             parts = []
-            if missing_med:
-                parts.append("Medication → " + ", ".join(missing_med))
-            if missing_vacc:
-                parts.append("Vaccination → " + ", ".join(missing_vacc))
+            if missing_med:  parts.append("Medication → "  + ", ".join(sorted(set(missing_med))))
+            if missing_vacc: parts.append("Vaccination → " + ", ".join(sorted(set(missing_vacc))))
+            parts.extend(extra_errors)
             status_map[key] = "ERROR: " + " ; ".join(parts)
         else:
             if med_intent and not vacc_intent:
@@ -399,17 +396,17 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
             else:
                 status_map[key] = "OK: No care data"
 
+        codes_map[key] = sorted(set(codes))
+
     care_df["Status"] = care_df["_gkey"].map(status_map).fillna("OK: No care data")
+    care_df["StatusReasonCodes"] = care_df["_gkey"].map(codes_map).apply(lambda v: v if isinstance(v, list) else [])
     return care_df.drop(columns=["_gkey"])
 
-# ===================== Utilities =====================
+# --------- Utilities / API ---------
 def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
-        return []
-    return json.loads(df.to_json(orient="records", date_format="iso"))
+    return [] if df is None or df.empty else json.loads(df.to_json(orient="records"))
 
-# ===================== FastAPI App =====================
-app = FastAPI(title="Poultry Fields API", version="1.3.0")
+app = FastAPI(title="Poultry Fields API", version="1.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -422,33 +419,14 @@ def health():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    """
-    يستقبل ملف Excel (اسم الحقل 'file') ويعيد JSON:
-      { "ops": [...], "care": [...] }
-    """
     content = await file.read()
-
-    # 1) load & normalize
     df = load_report_from_excel(content)
     df = strip_time_from_date_columns(df)
-
-    # 2) split
     sections = split_sections(df)
+    op_df   = add_operational_status(sections["operational"])
+    care_df = add_care_status(sections["care"])
+    return {"ops": df_to_records(op_df), "care": df_to_records(care_df)}
 
-    # 3) drop all-zero columns
-    op_df, _   = drop_all_zero_columns(sections["operational"])
-    care_df, _ = drop_all_zero_columns(sections["care"])
-
-    # 4) add Status
-    op_df   = add_operational_status(op_df)
-    care_df = add_care_status(care_df)
-
-    return {
-        "ops": df_to_records(op_df),
-        "care": df_to_records(care_df),
-    }
-
-# run:  python server.py
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
