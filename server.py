@@ -344,14 +344,18 @@ def _invalid_batch(v: Any) -> bool:
 
 def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
     if care_df.empty or ("Flock" not in care_df.columns) or ("Date" not in care_df.columns):
-        care_df["Status"] = ""; care_df["StatusReasonCodes"] = [[] for _ in range(len(care_df))]; return care_df
+        care_df["Status"] = ""
+        care_df["StatusReasonCodes"] = [[] for _ in range(len(care_df))]
+        return care_df
 
     care_df["_gkey"] = care_df["Flock"].astype(str).str.lower().str.strip() + "||" + care_df["Date"].astype(str)
     status_map, codes_map = {}, {}
 
     for key, g in care_df.groupby("_gkey", sort=False):
         if key.endswith("||"):
-            status_map[key] = "ERROR: Date"; codes_map[key]=["DATE_MISSING"]; continue
+            status_map[key] = "ERROR: Date"
+            codes_map[key] = ["DATE_MISSING"]
+            continue
 
         rows = [dict(r) for _, r in g.iterrows()]
         ref_dt = None
@@ -365,17 +369,15 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
         missing_med, missing_vacc = [], []
         extra_errors, codes = [], []
 
-        # Medication checks
+        # ===== Medication checks =====
         if med_intent:
             for col in CARE_MED_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
-                    missing_med.append(col); codes.append("MED_MISSING_"+_canon_key(col).upper())
+                    missing_med.append(col)
+                    codes.append("MED_MISSING_"+_canon_key(col).upper())
 
-            dose_any = any((_num_or_none(r.get("Medication Dose")) or 0) > 0 for r in rows)
-            has_unit = any(_canon_unit(r.get("Doses Unit")) for r in rows if not is_blank(r.get("Doses Unit")))
-            if dose_any and not has_unit:
-                if "Doses Unit" not in missing_med: missing_med.append("Doses Unit")
-                codes.append("MED_MISSING_DOSE_UNIT")
+            # (تم إلغاء شرط Doses Unit للـ Medication)
+            # لا تضيف MED_MISSING_DOSE_UNIT هنا
 
             if not any(not _invalid_batch(r.get("Medication Batch")) for r in rows):
                 if "Medication Batch" not in missing_med: missing_med.append("Medication Batch")
@@ -389,11 +391,12 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                         codes.append("MED_EXPIRED")
                         break
 
-        # Vaccination checks
+        # ===== Vaccination checks (يبقى شرط Doses Unit موجود) =====
         if vacc_intent:
             for col in CARE_VACC_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
-                    missing_vacc.append(col); codes.append("VACC_MISSING_"+_canon_key(col).upper())
+                    missing_vacc.append(col)
+                    codes.append("VACC_MISSING_"+_canon_key(col).upper())
 
             if not any(not _invalid_batch(r.get("VaccinationBatch")) for r in rows):
                 if "VaccinationBatch" not in missing_vacc: missing_vacc.append("VaccinationBatch")
