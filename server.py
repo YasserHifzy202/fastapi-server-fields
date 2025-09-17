@@ -1,4 +1,4 @@
-# server.py — Poultry Fields API (v1.4.2)
+# server.py — Poultry Fields API (v1.4.3)
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,13 +43,12 @@ def _num_or_none(v: Any) -> Optional[float]:
 
 BAD_DATE_TOKENS = {"", "0", "00/00/0000", "0000-00-00", "#value!", "#value", "value", "value!"}
 
-# === بدّل هذا التعريف كليًا ===
 def _dt_or_none(v: Any):
     s = _canon_token(v)
     if s in BAD_DATE_TOKENS:
         return None
 
-    # Excel serial (يدعم 45123 و 45123.0)
+    # Excel serial (يدعم مثل 45123 أو 45123.0)
     try:
         n = float(s)
         if 20000 < n < 80000:
@@ -58,18 +57,16 @@ def _dt_or_none(v: Any):
     except:
         pass
 
-    # parse بكل هدوء ثم تحوّل لـ None لو كانت NaT
-    ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    # إذا التاريخ ISO يبدأ بسنة (YYYY-..)، خلي dayfirst=False لتفادي التحذير
+    iso_like = bool(re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", s))
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=not iso_like)
     if pd.isna(ts):
         return None
     try:
-        # Timestamp -> datetime
         return ts.to_pydatetime()
     except AttributeError:
-        # لو هو datetime أصلاً
         return ts if isinstance(ts, datetime) else None
 
-# === وبدّل هذا التعريف أيضًا ===
 def _date_strict(v: Any) -> str:
     try:
         dt = _dt_or_none(v)
@@ -158,14 +155,11 @@ def drop_columns_by_names(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
     keep = [c for c in df.columns if _canon_key(c) not in target]
     return df[keep]
 
-# --------- Load Excel (supports .xls + .xlsx) ---------
+# --------- Load Excel (supports .xlsx; .xls يرجع رسالة واضحة إن لم يتوفر محرّك) ---------
 def load_report_from_excel(content: bytes, filename: Optional[str]) -> pd.DataFrame:
     try:
-        name = (filename or "").lower()
-        engine = "openpyxl"
-        if name.endswith(".xls"):  # legacy
-            engine = "xlrd"
-        xl = pd.ExcelFile(io.BytesIO(content), engine=engine)
+        # نخلي Pandas يختار المحرك تلقائياً
+        xl = pd.ExcelFile(io.BytesIO(content))
         pick = None
         for s in xl.sheet_names:
             if s.strip().lower() in {"export","ag-grid"}:
@@ -173,9 +167,13 @@ def load_report_from_excel(content: bytes, filename: Optional[str]) -> pd.DataFr
         if pick is None: pick = xl.sheet_names[0]
         df = xl.parse(pick)
     except Exception as e:
+        name = (filename or "").lower()
+        hint = ""
+        if name.endswith(".xls"):
+            hint = " • Tip: convert this file to .xlsx before uploading."
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to read Excel ({filename}): {e}"
+            detail=f"Failed to read Excel ({filename}): {e}{hint}"
         )
 
     # normalize + clean
@@ -327,6 +325,23 @@ def _field_present(field: str, value: Any) -> bool:
 def _any_present(rows: List[dict], cols: List[str]) -> bool:
     return any(not is_blank(r.get(c, "")) for r in rows for c in cols)
 
+# يعتبر قيم باتش Placeholder وغير صالحة
+PLACEHOLDER_BATCH_TOKENS = {
+    "", "-", "—", "na", "n/a", "null", "none", "0", "00", "000", "xx", "xxx", "."
+}
+def _invalid_batch(v: Any) -> bool:
+    s = _canon_token(v)
+    if s in PLACEHOLDER_BATCH_TOKENS:
+        return True
+    # حذف غير-ألفا-نوميريك للتأكد من وجود رمز فعلي
+    s2 = re.sub(r"[^a-z0-9]", "", s)
+    if not s2:
+        return True
+    # إذا كلها أصفار أو أقصر من 3 حروف/أرقام نعدّها غير صالحة
+    if set(s2) == {"0"}:
+        return True
+    return len(s2) < 3
+
 def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
     if care_df.empty or ("Flock" not in care_df.columns) or ("Date" not in care_df.columns):
         care_df["Status"] = ""; care_df["StatusReasonCodes"] = [[] for _ in range(len(care_df))]; return care_df
@@ -424,7 +439,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
 def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return [] if df is None or df.empty else json.loads(df.to_json(orient="records"))
 
-app = FastAPI(title="Poultry Fields API", version="1.4.2")
+app = FastAPI(title="Poultry Fields API", version="1.4.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
