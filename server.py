@@ -43,11 +43,13 @@ def _num_or_none(v: Any) -> Optional[float]:
 
 BAD_DATE_TOKENS = {"", "0", "00/00/0000", "0000-00-00", "#value!", "#value", "value", "value!"}
 
+# === بدّل هذا التعريف كليًا ===
 def _dt_or_none(v: Any):
     s = _canon_token(v)
     if s in BAD_DATE_TOKENS:
         return None
-    # excel serial
+
+    # Excel serial (يدعم 45123 و 45123.0)
     try:
         n = float(s)
         if 20000 < n < 80000:
@@ -55,18 +57,26 @@ def _dt_or_none(v: Any):
             return base + pd.to_timedelta(int(n), unit="D")
     except:
         pass
-    try:
-        return pd.to_datetime(s, errors="coerce", dayfirst=True).to_pydatetime()
-    except:
+
+    # parse بكل هدوء ثم تحوّل لـ None لو كانت NaT
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.isna(ts):
         return None
+    try:
+        # Timestamp -> datetime
+        return ts.to_pydatetime()
+    except AttributeError:
+        # لو هو datetime أصلاً
+        return ts if isinstance(ts, datetime) else None
 
+# === وبدّل هذا التعريف أيضًا ===
 def _date_strict(v: Any) -> str:
-    dt = _dt_or_none(v)
-    return "" if dt is None else dt.strftime("%Y-%m-%d")
-
-def _invalid_batch(v: Any) -> bool:
-    s = _canon_token(v)
-    return s in {"", "-", "na", "null", "0", "000"}
+    try:
+        dt = _dt_or_none(v)
+        return "" if dt is None else dt.strftime("%Y-%m-%d")
+    except Exception:
+        # أي شيء غير متوقّع => فرّغ الحقل بدل ما نطيح بـ 500
+        return ""
 
 # --------- Aliases ---------
 COLUMN_ALIASES = {
