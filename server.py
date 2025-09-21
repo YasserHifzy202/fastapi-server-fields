@@ -1,4 +1,4 @@
-# server.py — Poultry Fields API (v1.4.3)
+# server.py — Poultry Fields API (v1.4.4)
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +12,14 @@ STRICT_USER_ID_ONLY       = True
 FALLBACK_TO_INDICATORS    = False
 STRIP_NON_SECTION_COLUMNS = True
 DROP_LAST_N_ROWS          = 2
-ZERO_DATE_VALUE           = ""
+
+# أي تاريخ انتهاء أقدم من هذا يعتبر Placeholder (غير صالح)
+MIN_VALID_EXP_YEAR        = 2000
 
 # =============== Helpers ===============
 def _to_ascii_digits(s: str) -> str:
     if not isinstance(s, str): s = str(s or "")
-    # Arabic-Indic + Eastern Arabic-Indic
     s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹","01234567890123456789"))
-    # احذف محارف التحكم
     return "".join(ch for ch in s if not unicodedata.category(ch).startswith("C"))
 
 def _canon_token(v: Any) -> str:
@@ -41,38 +41,54 @@ def _num_or_none(v: Any) -> Optional[float]:
     try: return float(m.group(0).replace(",", "."))
     except: return None
 
-BAD_DATE_TOKENS = {"", "0", "00/00/0000", "0000-00-00", "#value!", "#value", "value", "value!"}
+# قيم نصية شائعة للتواريخ غير الصالحة
+BAD_DATE_TOKENS = {
+    "", "0", "00/00/0000", "0000-00-00",
+    "#value!", "#value", "value", "value!",
+    # Placeholders شائعة من إكسل
+    "1899-11-30", "1899-12-30", "1899-12-31",
+    "30/11/1899", "31/12/1899"
+}
 
 def _dt_or_none(v: Any):
+    """
+    يحوّل القيم إلى datetime أو يرجّع None للقيم الفارغة/التالفة/القديمة جدًا.
+    """
     s = _canon_token(v)
     if s in BAD_DATE_TOKENS:
         return None
 
-    # Excel serial (يدعم مثل 45123 أو 45123.0)
+    # Excel serial (مثل 45123 أو 45123.0)
     try:
         n = float(s)
         if 20000 < n < 80000:
             base = datetime(1899, 12, 30)
-            return base + pd.to_timedelta(int(n), unit="D")
+            dt = base + pd.to_timedelta(int(n), unit="D")
+            if dt.year < MIN_VALID_EXP_YEAR:  # حماية إضافية
+                return None
+            return dt
     except:
         pass
 
-    # إذا التاريخ ISO يبدأ بسنة (YYYY-..)، خلي dayfirst=False لتفادي التحذير
+    # إذا التاريخ ISO يبدأ بسنة (YYYY-..)، dayfirst=False
     iso_like = bool(re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", s))
     ts = pd.to_datetime(s, errors="coerce", dayfirst=not iso_like)
     if pd.isna(ts):
         return None
     try:
-        return ts.to_pydatetime()
+        dt = ts.to_pydatetime()
     except AttributeError:
-        return ts if isinstance(ts, datetime) else None
+        dt = ts if isinstance(ts, datetime) else None
+
+    if dt and dt.year < MIN_VALID_EXP_YEAR:
+        return None
+    return dt
 
 def _date_strict(v: Any) -> str:
     try:
         dt = _dt_or_none(v)
         return "" if dt is None else dt.strftime("%Y-%m-%d")
     except Exception:
-        # أي شيء غير متوقّع => فرّغ الحقل بدل ما نطيح بـ 500
         return ""
 
 # --------- Aliases ---------
@@ -155,10 +171,9 @@ def drop_columns_by_names(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
     keep = [c for c in df.columns if _canon_key(c) not in target]
     return df[keep]
 
-# --------- Load Excel (supports .xlsx; .xls يرجع رسالة واضحة إن لم يتوفر محرّك) ---------
+# --------- Load Excel ---------
 def load_report_from_excel(content: bytes, filename: Optional[str]) -> pd.DataFrame:
     try:
-        # نخلي Pandas يختار المحرك تلقائياً
         xl = pd.ExcelFile(io.BytesIO(content))
         pick = None
         for s in xl.sheet_names:
@@ -180,11 +195,10 @@ def load_report_from_excel(content: bytes, filename: Optional[str]) -> pd.DataFr
     df = normalize_headers(df).fillna("")
     df = normalize_domain_columns(df)
 
+    # نظّف تواريخ الانتهاء: حوّل قيم placeholder إلى فراغ
     for col in ["Medication Exp Date","Vaccination Exp Date"]:
         if col in df.columns:
-            s = df[col].astype(str).str.strip()
-            bad = s.str.upper().isin({"#VALUE!","#VALUE","VALUE!","VALUE"}) | s.isin(["0","00/00/0000","0000-00-00"])
-            df.loc[bad, col] = ""
+            df[col] = df[col].apply(lambda x: "" if (_dt_or_none(x) is None) else _date_strict(x))
 
     if DROP_LAST_N_ROWS and len(df) >= DROP_LAST_N_ROWS:
         df = df.iloc[:-DROP_LAST_N_ROWS, :].copy()
@@ -317,6 +331,9 @@ def _canon_unit(v: Any) -> str:
     return s
 
 def _field_present(field: str, value: Any) -> bool:
+    # اعتبر تواريخ الانتهاء موجودة فقط إذا كانت صالحة (ليس Placeholder)
+    if field in ("Medication Exp Date", "Vaccination Exp Date"):
+        return _dt_or_none(value) is not None
     if field in NUMERICISH_REQUIRED:
         n = _num_or_none(value)
         return (n is not None) and (n > 0)
@@ -325,7 +342,6 @@ def _field_present(field: str, value: Any) -> bool:
 def _any_present(rows: List[dict], cols: List[str]) -> bool:
     return any(not is_blank(r.get(c, "")) for r in rows for c in cols)
 
-# يعتبر قيم باتش Placeholder وغير صالحة
 PLACEHOLDER_BATCH_TOKENS = {
     "", "-", "—", "na", "n/a", "null", "none", "0", "00", "000", "xx", "xxx", "."
 }
@@ -333,11 +349,9 @@ def _invalid_batch(v: Any) -> bool:
     s = _canon_token(v)
     if s in PLACEHOLDER_BATCH_TOKENS:
         return True
-    # حذف غير-ألفا-نوميريك للتأكد من وجود رمز فعلي
     s2 = re.sub(r"[^a-z0-9]", "", s)
     if not s2:
         return True
-    # إذا كلها أصفار أو أقصر من 3 حروف/أرقام نعدّها غير صالحة
     if set(s2) == {"0"}:
         return True
     return len(s2) < 3
@@ -376,9 +390,6 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                     missing_med.append(col)
                     codes.append("MED_MISSING_"+_canon_key(col).upper())
 
-            # (تم إلغاء شرط Doses Unit للـ Medication)
-            # لا تضيف MED_MISSING_DOSE_UNIT هنا
-
             if not any(not _invalid_batch(r.get("Medication Batch")) for r in rows):
                 if "Medication Batch" not in missing_med: missing_med.append("Medication Batch")
                 codes.append("MED_MISSING_BATCH")
@@ -391,7 +402,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
                         codes.append("MED_EXPIRED")
                         break
 
-        # ===== Vaccination checks (يبقى شرط Doses Unit موجود) =====
+        # ===== Vaccination checks =====
         if vacc_intent:
             for col in CARE_VACC_REQ:
                 if not any(_field_present(col, r.get(col)) for r in rows):
@@ -442,7 +453,7 @@ def add_care_status(care_df: pd.DataFrame) -> pd.DataFrame:
 def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return [] if df is None or df.empty else json.loads(df.to_json(orient="records"))
 
-app = FastAPI(title="Poultry Fields API", version="1.4.3")
+app = FastAPI(title="Poultry Fields API", version="1.4.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -466,7 +477,6 @@ async def analyze(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        # اطبع الستاك للّوغز في Render وسلّم رد واضح للواجهة
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
